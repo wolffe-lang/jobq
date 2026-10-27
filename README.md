@@ -76,7 +76,6 @@ Run with 2 concurrent runners:
 ```
 $ ./jobq run --dir /tmp/myq -j 2
 jobq: ran 4 jobs
-read_dir calls: 2
 ```
 
 List jobs:
@@ -143,7 +142,6 @@ $ ./jobq add --dir /tmp/myq -- sh -c 'exit 3'
 5
 $ ./jobq run --dir /tmp/myq -j 1
 jobq: ran 1 jobs
-read_dir calls: 1
 $ echo $?
 1
 $ ./jobq ls --dir /tmp/myq --state failed
