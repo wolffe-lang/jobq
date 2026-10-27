@@ -480,7 +480,7 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
         return 0
     }
     print("jobq: ran {count} jobs")
-    print("read_dir calls: {read_dir_calls}")
+    eprint("read_dir calls: {read_dir_calls}")
     if any_failed {
         return 1
     }

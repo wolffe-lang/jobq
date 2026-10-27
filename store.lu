@@ -499,7 +499,7 @@ pub fn claim_job_from(names: List[str], dir: str) -> str ! {not_found, denied, i
         // Parse BEFORE the rename — malformed files stay where they are
         read_job(path) else |e| match e {
             parse => {
-                print("jobq: queue/" + name + ": malformed (line 1)")
+                eprint("jobq: queue/" + name + ": malformed (line 1)")
                 continue
             },
             not_found => { continue },

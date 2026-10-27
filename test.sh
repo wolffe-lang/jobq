@@ -318,16 +318,16 @@ echo "this is not a valid job file" > "$DIR/queue/000001-1.job"
 # Add a valid job
 "$JOBQ" add --dir "$DIR" -- echo "valid" > /dev/null
 # Run — the malformed job should be skipped, the valid one should run
-RUNNER_OUTPUT=$("$JOBQ" run --dir "$DIR" -j 1 2>&1) || true
+RUNNER_STDERR=$("$JOBQ" run --dir "$DIR" -j 1 2>&1 >/dev/null) || true
 DONE=$("$JOBQ" ls --dir "$DIR" --state done | wc -l)
 if [ "$DONE" -ge 1 ]; then
     # Check the malformed file is still in queue/
     if [ -f "$DIR/queue/000001-1.job" ]; then
-        # Check the runner printed the malformed line
-        if echo "$RUNNER_OUTPUT" | grep -q "malformed"; then
+        # Check the runner printed the malformed line on stderr
+        if echo "$RUNNER_STDERR" | grep -q "malformed"; then
             pass "M1"
         else
-            fail "M1: no malformed message"
+            fail "M1: no malformed message on stderr"
         fi
     else
         fail "M1: malformed file moved"
@@ -345,12 +345,12 @@ DIR="/tmp/jobq-test-p1"
 seq 1 10000 | while read i; do echo "true"; done > /tmp/jobq-test-p1-input.txt
 "$JOBQ" add --dir "$DIR" -f /tmp/jobq-test-p1-input.txt > /dev/null
 START=$(date +%s)
-RUNNER_OUTPUT=$("$JOBQ" run --dir "$DIR" -j 8 2>&1)
+RUNNER_STDERR=$("$JOBQ" run --dir "$DIR" -j 8 2>&1 >/dev/null)
 END=$(date +%s)
 ELAPSED=$((END - START))
 DONE=$("$JOBQ" ls --dir "$DIR" --state done | wc -l)
-# Extract read_dir calls from output
-READ_DIR_CALLS=$(echo "$RUNNER_OUTPUT" | grep "read_dir calls:" | awk '{print $NF}')
+# Extract read_dir calls from stderr
+READ_DIR_CALLS=$(echo "$RUNNER_STDERR" | grep "read_dir calls:" | awk '{print $NF}')
 if [ "$DONE" -eq 10000 ] && [ "$ELAPSED" -le 60 ]; then
     if [ -n "$READ_DIR_CALLS" ] && [ "$READ_DIR_CALLS" -le 1260 ]; then
         pass "P1 (${ELAPSED}s, $DONE done, read_dir=$READ_DIR_CALLS)"
