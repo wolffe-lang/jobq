@@ -299,7 +299,7 @@ else
 fi
 rm -rf "$DIR"
 
-# M1: Malformed job file is skipped, valid job runs
+# M1: Malformed job file is skipped with a message, valid job runs
 echo "=== M1: Malformed job ==="
 DIR="/tmp/jobq-test-m1"
 "$JOBQ" init "$DIR"
@@ -308,12 +308,17 @@ echo "this is not a valid job file" > "$DIR/queue/000001-1.job"
 # Add a valid job
 "$JOBQ" add --dir "$DIR" -- echo "valid" > /dev/null
 # Run — the malformed job should be skipped, the valid one should run
-"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1 || true
+RUNNER_OUTPUT=$("$JOBQ" run --dir "$DIR" -j 1 2>&1) || true
 DONE=$("$JOBQ" ls --dir "$DIR" --state done | wc -l)
 if [ "$DONE" -ge 1 ]; then
     # Check the malformed file is still in queue/
     if [ -f "$DIR/queue/000001-1.job" ]; then
-        pass "M1"
+        # Check the runner printed the malformed line
+        if echo "$RUNNER_OUTPUT" | grep -q "malformed"; then
+            pass "M1"
+        else
+            fail "M1: no malformed message"
+        fi
     else
         fail "M1: malformed file moved"
     fi
