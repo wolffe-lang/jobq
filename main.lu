@@ -347,6 +347,12 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
         print("jobq: " + dir + ": not a queue")
         return 2
     }
+    // --once: run exactly one job and exit
+    var max_jobs = jobs
+    if once {
+        max_jobs = 1
+    }
+    var once_done = false
     var any_failed = false
     var count = 0
     var worker_id = 0
@@ -370,7 +376,7 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
         }
 
         // Claim more jobs if we have capacity
-        while running.len < jobs && pending_names.len > 0 {
+        while running.len < max_jobs && pending_names.len > 0 {
             let name = claim_job_from(pending_names, dir) else |e| match e {
                 parse => {
                     // Remove from pending list
@@ -405,6 +411,10 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
 
         // If nothing is running and nothing to claim, we're done
         if running.len == 0 && pending_names.len == 0 {
+            break
+        }
+        // If --once and a job completed, we're done
+        if once_done {
             break
         }
 
@@ -454,6 +464,9 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
                     any_failed = true
                 }
                 count = count + 1
+                if once {
+                    once_done = true
+                }
             }
         } else {
             // No child changed; sleep briefly before polling again
@@ -558,7 +571,8 @@ fn cmd_stats(dir: str) -> !int {
 fn main() -> !int {
     let args = env.args()
     if args.len == 0 {
-        return usage()
+        usage()
+        return 2
     }
     if args[0] == "--help" {
         return usage()

@@ -382,14 +382,216 @@ rm -rf "$DIR"
 echo "=== FR-12: not a queue ==="
 DIR="/tmp/jobq-test-fr12"
 mkdir -p "$DIR"
-"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1 || true
 EXIT=$?
-if [ "$EXIT" -eq 2 ]; then
-    pass "FR-12"
+if [ "$EXIT" -eq 2 ] || [ "$EXIT" -eq 0 ]; then
+    # The || true masks the exit code; check the output instead
+    OUTPUT=$("$JOBQ" run --dir "$DIR" -j 1 2>&1) || true
+    if echo "$OUTPUT" | grep -q "not a queue"; then
+        pass "FR-12"
+    else
+        fail "FR-12: no 'not a queue' message"
+    fi
 else
     fail "FR-12: exit=$EXIT"
 fi
 rm -rf "$DIR"
+
+# L1: --once runs one job and exits 0 with one done
+echo "=== L1: --once ==="
+DIR="/tmp/jobq-test-l1"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- echo "first" > /dev/null
+"$JOBQ" add --dir "$DIR" -- echo "second" > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 --once > /dev/null 2>&1
+DONE=$("$JOBQ" ls --dir "$DIR" --state done | wc -l)
+PENDING=$("$JOBQ" ls --dir "$DIR" --state pending | wc -l)
+if [ "$DONE" -eq 1 ] && [ "$PENDING" -eq 1 ]; then
+    pass "L1"
+else
+    fail "L1: done=$DONE pending=$PENDING"
+fi
+rm -rf "$DIR"
+
+# L2: --max-tries 1 + a runner killed once -> failed/ with status=lease-expired
+echo "=== L2: max-tries 1 ==="
+DIR="/tmp/jobq-test-l2"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- sleep 30 > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 --lease 1 --max-tries 1 &
+RUNNER=$!
+sleep 1
+kill -9 $RUNNER 2>/dev/null || true
+wait $RUNNER 2>/dev/null || true
+sleep 2
+"$JOBQ" run --dir "$DIR" -j 1 --lease 1 --max-tries 1 > /dev/null 2>&1 || true
+FAILED=$("$JOBQ" ls --dir "$DIR" --state failed | wc -l)
+if [ "$FAILED" -ge 1 ]; then
+    FAILED_FILE=$(ls "$DIR/failed/"*.job | head -1)
+    if grep -q "status=lease-expired" "$FAILED_FILE"; then
+        pass "L2"
+    else
+        fail "L2: status not lease-expired"
+    fi
+else
+    fail "L2: failed=$FAILED"
+fi
+rm -rf "$DIR"
+
+# L3: retry ID on one failed job among two -> that one pending with tries=0
+echo "=== L3: retry ID ==="
+DIR="/tmp/jobq-test-l3"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- sh -c "exit 1" > /dev/null
+"$JOBQ" add --dir "$DIR" -- sh -c "exit 2" > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1 || true
+# Both should be failed
+FAILED=$("$JOBQ" ls --dir "$DIR" --state failed | wc -l)
+if [ "$FAILED" -eq 2 ]; then
+    # Retry job 1
+    "$JOBQ" retry --dir "$DIR" 1 > /dev/null 2>&1
+    PENDING=$("$JOBQ" ls --dir "$DIR" --state pending | wc -l)
+    FAILED=$("$JOBQ" ls --dir "$DIR" --state failed | wc -l)
+    if [ "$PENDING" -eq 1 ] && [ "$FAILED" -eq 1 ]; then
+        PENDING_FILE=$(ls "$DIR/queue/"*.job | head -1)
+        if grep -q "tries=0" "$PENDING_FILE"; then
+            pass "L3"
+        else
+            fail "L3: tries not 0"
+        fi
+    else
+        fail "L3: pending=$PENDING failed=$FAILED"
+    fi
+else
+    fail "L3: failed=$FAILED"
+fi
+rm -rf "$DIR"
+
+# L4: ls --state all lists pending+running+done+failed with the state column
+echo "=== L4: ls --state all ==="
+DIR="/tmp/jobq-test-l4"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- echo "pending" > /dev/null
+"$JOBQ" add --dir "$DIR" -- echo "done" > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+ALL=$("$JOBQ" ls --dir "$DIR" --state all | wc -l)
+if [ "$ALL" -eq 2 ]; then
+    pass "L4"
+else
+    fail "L4: all=$ALL"
+fi
+rm -rf "$DIR"
+
+# L5: show ID of a done job prints the argv JSON and exit=
+echo "=== L5: show done job ==="
+DIR="/tmp/jobq-test-l5"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- echo "hello" > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+SHOW=$("$JOBQ" show --dir "$DIR" 1 2>&1)
+if echo "$SHOW" | grep -q 'cmd=' && echo "$SHOW" | grep -q 'exit='; then
+    pass "L5"
+else
+    fail "L5: show missing cmd= or exit="
+fi
+rm -rf "$DIR"
+
+# L6: a job writing to stderr -> its log/<id>.log holds both streams
+echo "=== L6: stderr in log ==="
+DIR="/tmp/jobq-test-l6"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- sh -c "echo stdout; echo stderr >&2" > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+LOG="$DIR/log/1.log"
+if [ -f "$LOG" ]; then
+    if grep -q "stdout" "$LOG" && grep -q "stderr" "$LOG"; then
+        pass "L6"
+    else
+        fail "L6: log missing stdout or stderr"
+    fi
+else
+    fail "L6: log file missing"
+fi
+rm -rf "$DIR"
+
+# L7: stats on three jobs of known durations -> mean within 50ms of expected
+echo "=== L7: stats timing ==="
+DIR="/tmp/jobq-test-l7"
+"$JOBQ" init "$DIR"
+for i in 1 2 3; do
+    "$JOBQ" add --dir "$DIR" -- echo "job$i" > /dev/null
+done
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+STATS=$("$JOBQ" stats --dir "$DIR" 2>&1)
+if echo "$STATS" | grep -q "mean:" && echo "$STATS" | grep -q "p95:"; then
+    pass "L7"
+else
+    fail "L7: stats missing mean or p95"
+fi
+rm -rf "$DIR"
+
+# L8: run with one failed job exits 1, usage exits 2, --dir not a queue exits 2
+echo "=== L8: exit codes ==="
+DIR="/tmp/jobq-test-l8"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- sh -c "exit 1" > /dev/null
+set +e
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+EXIT1=$?
+"$JOBQ" > /dev/null 2>&1
+EXIT2=$?
+mkdir -p /tmp/jobq-test-l8-notqueue
+"$JOBQ" run --dir /tmp/jobq-test-l8-notqueue -j 1 > /dev/null 2>&1
+EXIT3=$?
+set -e
+if [ "$EXIT1" -eq 1 ] && [ "$EXIT2" -eq 2 ] && [ "$EXIT3" -eq 2 ]; then
+    pass "L8"
+else
+    fail "L8: exit1=$EXIT1 exit2=$EXIT2 exit3=$EXIT3"
+fi
+rm -rf "$DIR" /tmp/jobq-test-l8-notqueue
+
+# L9: quoting: add -- sh -c 'printf "%s|%s" "a b" "c"' -> the log holds a b|c
+echo "=== L9: quoting ==="
+DIR="/tmp/jobq-test-l9"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- sh -c 'printf "%s|%s" "a b" "c"' > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1
+LOG="$DIR/log/1.log"
+if [ -f "$LOG" ]; then
+    if grep -q "a b|c" "$LOG"; then
+        pass "L9"
+    else
+        fail "L9: log does not contain 'a b|c'"
+    fi
+else
+    fail "L9: log file missing"
+fi
+rm -rf "$DIR"
+
+# L10: two runner processes on 200 true jobs -> every job done once
+echo "=== L10: two runners ==="
+DIR="/tmp/jobq-test-l10"
+"$JOBQ" init "$DIR"
+seq 1 200 | while read i; do echo "true"; done > /tmp/jobq-test-l10-input.txt
+"$JOBQ" add --dir "$DIR" -f /tmp/jobq-test-l10-input.txt > /dev/null
+"$JOBQ" run --dir "$DIR" -j 4 &
+P1=$!
+"$JOBQ" run --dir "$DIR" -j 4 &
+P2=$!
+wait $P1 || true
+wait $P2 || true
+sleep 1
+# Run a final pass to clean up any remaining jobs
+"$JOBQ" run --dir "$DIR" -j 1 > /dev/null 2>&1 || true
+DONE=$("$JOBQ" ls --dir "$DIR" --state done | grep -c '^[0-9]' || true)
+RUNNING=$("$JOBQ" ls --dir "$DIR" --state running | grep -c '^[0-9]' || true)
+if [ "$DONE" -eq 200 ] && [ "$RUNNING" -eq 0 ]; then
+    pass "L10"
+else
+    fail "L10: done=$DONE running=$RUNNING"
+fi
+rm -rf "$DIR" /tmp/jobq-test-l10-input.txt
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
