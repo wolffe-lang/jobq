@@ -427,8 +427,8 @@ sleep 2
 "$JOBQ" run --dir "$DIR" -j 1 --lease 1 --max-tries 1 > /dev/null 2>&1 || true
 FAILED=$("$JOBQ" ls --dir "$DIR" --state failed | wc -l)
 if [ "$FAILED" -ge 1 ]; then
-    FAILED_FILE=$(ls "$DIR/failed/"*.job | head -1)
-    if grep -q "status=lease-expired" "$FAILED_FILE"; then
+    FAILED_FILE=$(ls "$DIR/failed/"*.job 2>/dev/null | head -1)
+    if [ -n "$FAILED_FILE" ] && grep -q "status=lease-expired" "$FAILED_FILE"; then
         pass "L2"
     else
         fail "L2: status not lease-expired"
