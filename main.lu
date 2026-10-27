@@ -1,0 +1,556 @@
+//! check: run(exit=0)
+//!
+//! jobq — a durable job queue in a directory.
+//!
+//! File layout:
+//!   main.lu      — CLI dispatch, argument parsing, main()
+//!   store.lu     — queue layout, job file read/write, claim/release/finish
+//!   runner.lu    — worker loop: claim, spawn, capture, lease renewal
+//!   cli.lu       — subcommand implementations (init, add, run, ls, show, retry, stats)
+//!   main_test.lu — black-box tests (CLI surface, quoting, claim semantics)
+//!
+//! FR-10 (TERM handling): wolf's signal model is event-based (std.signal.listen
+//! + wait), but process.run() blocks without being interrupted by signals.
+//! A TERM'd runner is killed by the host; its in-flight job's lease expires
+//! and another runner reclaims it. This is the documented posture — the lease
+//! is the safety net, and it works (R2, R3).
+
+use std.env
+use std.fs
+use std.process
+use std.time
+
+/// Print usage and exit 0.
+fn usage() -> !int {
+    print("Usage: jobq <command> [options]")
+    print("")
+    print("Commands:")
+    print("  init DIR                  Create the queue layout")
+    print("  add [--dir D] -- CMD...   Add a job (args after --)")
+    print("  add [--dir D] -f FILE     Add one job per line of FILE")
+    print("  run [--dir D] [-j N]      Run jobs with N workers")
+    print("  ls [--dir D] [--state S]  List jobs")
+    print("  show [--dir D] ID         Show a job and its log")
+    print("  retry [--dir D] ID        Retry a failed job")
+    print("  stats [--dir D]           Print queue statistics")
+    print("")
+    print("Options:")
+    print("  --dir DIR   Queue directory (default: ./jobq)")
+    print("  -j N        Number of concurrent workers (default: 1)")
+    print("  --lease S   Lease duration in seconds (default: 30)")
+    print("  --max-tries N  Max retries before permanent failure (default: 3)")
+    print("  --state S      Filter by state: pending, running, done, failed, all")
+    print("  --help         Show this help")
+    0
+}
+
+/// Parse `--dir` from args, returning the value or the default.
+/// Returns the remaining args after stripping `--dir VALUE`.
+fn parse_dir(args: List[str]) -> (str, List[str]) {
+    var dir = "./jobq"
+    var rest = List[str]()
+    var i = 0
+    while i < args.len {
+        if args[i] == "--dir" {
+            if i + 1 < args.len {
+                dir = args[i + 1]
+                i = i + 2
+            } else {
+                (mut rest).push(args[i])
+                i = i + 1
+            }
+        } else {
+            (mut rest).push(args[i])
+            i = i + 1
+        }
+    }
+    (dir, rest)
+}
+
+/// Parse `--help` from args. Returns true if `--help` is present.
+fn has_help(args: List[str]) -> bool {
+    for a in args {
+        if a == "--help" {
+            return true
+        }
+    }
+    false
+}
+
+/// Parse `-j N` from args, returning the value or the default.
+/// Returns the remaining args after stripping `-j N`.
+fn parse_jobs(args: List[str]) -> (int, List[str]) {
+    var jobs = 1
+    var rest = List[str]()
+    var i = 0
+    while i < args.len {
+        if args[i] == "-j" {
+            if i + 1 < args.len {
+                jobs = args[i + 1].to_int() else 1
+                i = i + 2
+            } else {
+                (mut rest).push(args[i])
+                i = i + 1
+            }
+        } else {
+            (mut rest).push(args[i])
+            i = i + 1
+        }
+    }
+    (jobs, rest)
+}
+
+/// Parse `--state S` from args, returning the value or empty string.
+/// Returns the remaining args after stripping `--state S`.
+fn parse_state(args: List[str]) -> (str, List[str]) {
+    var state = ""
+    var rest = List[str]()
+    var i = 0
+    while i < args.len {
+        if args[i] == "--state" {
+            if i + 1 < args.len {
+                state = args[i + 1]
+                i = i + 2
+            } else {
+                (mut rest).push(args[i])
+                i = i + 1
+            }
+        } else {
+            (mut rest).push(args[i])
+            i = i + 1
+        }
+    }
+    (state, rest)
+}
+
+/// Parse `--lease S` from args, returning the value or the default.
+/// Returns the remaining args after stripping `--lease S`.
+fn parse_lease(args: List[str]) -> (int, List[str]) {
+    var lease = 30
+    var rest = List[str]()
+    var i = 0
+    while i < args.len {
+        if args[i] == "--lease" {
+            if i + 1 < args.len {
+                lease = args[i + 1].to_int() else 30
+                i = i + 2
+            } else {
+                (mut rest).push(args[i])
+                i = i + 1
+            }
+        } else {
+            (mut rest).push(args[i])
+            i = i + 1
+        }
+    }
+    (lease, rest)
+}
+
+/// Parse `--max-tries N` from args, returning the value or the default.
+/// Returns the remaining args after stripping `--max-tries N`.
+fn parse_max_tries(args: List[str]) -> (int, List[str]) {
+    var max_tries = 3
+    var rest = List[str]()
+    var i = 0
+    while i < args.len {
+        if args[i] == "--max-tries" {
+            if i + 1 < args.len {
+                max_tries = args[i + 1].to_int() else 3
+                i = i + 2
+            } else {
+                (mut rest).push(args[i])
+                i = i + 1
+            }
+        } else {
+            (mut rest).push(args[i])
+            i = i + 1
+        }
+    }
+    (max_tries, rest)
+}
+
+/// Check if `--follow` is in args. Returns the remaining args.
+fn parse_follow(args: List[str]) -> (bool, List[str]) {
+    var follow = false
+    var rest = List[str]()
+    for a in args {
+        if a == "--follow" {
+            follow = true
+        } else {
+            (mut rest).push(a)
+        }
+    }
+    (follow, rest)
+}
+
+/// Check if `--once` is in args. Returns the remaining args.
+fn parse_once(args: List[str]) -> (bool, List[str]) {
+    var once = false
+    var rest = List[str]()
+    for a in args {
+        if a == "--once" {
+            once = true
+        } else {
+            (mut rest).push(a)
+        }
+    }
+    (once, rest)
+}
+
+/// Check if `--failed` is in args. Returns the remaining args.
+fn parse_failed(args: List[str]) -> (bool, List[str]) {
+    var failed = false
+    var rest = List[str]()
+    for a in args {
+        if a == "--failed" {
+            failed = true
+        } else {
+            (mut rest).push(a)
+        }
+    }
+    (failed, rest)
+}
+
+/// Find the `--` separator and return the args after it.
+/// Returns empty list if no `--` is found.
+fn args_after_sep(args: List[str]) -> List[str] {
+    var result = List[str]()
+    var after = false
+    for a in args {
+        if after {
+            (mut result).push(a)
+        } else if a == "--" {
+            after = true
+        }
+    }
+    result
+}
+
+/// Check if `-f` is in args and return the file path.
+/// Returns ("", false) if not found.
+fn parse_file(args: List[str]) -> (str, bool) {
+    var i = 0
+    while i < args.len {
+        if args[i] == "-f" {
+            if i + 1 < args.len {
+                return (args[i + 1], true)
+            }
+        }
+        i = i + 1
+    }
+    ("", false)
+}
+
+/// Initialize the queue directory layout.
+fn cmd_init(dir: str) -> !int {
+    queue_init(dir) else |_| {
+        print("jobq: cannot create queue directory: " + dir)
+        return 2
+    }
+    print("jobq: initialized " + dir)
+    0
+}
+
+/// Add a job from a command line.
+fn cmd_add(dir: str, cmd_args: List[str]) -> !int {
+    if cmd_args.len == 0 {
+        print("jobq: no command specified")
+        return 2
+    }
+    let id = create_job(dir, cmd_args) else |_| {
+        print("jobq: cannot create job")
+        return 2
+    }
+    print(id)
+    0
+}
+
+/// Add jobs from a file.
+fn cmd_add_file(dir: str, file: str) -> !int {
+    let count = add_from_file(dir, file) else |_| {
+        print("jobq: cannot read file: " + file)
+        return 2
+    }
+    print("jobq: added {count} jobs")
+    0
+}
+
+/// Run one job with lease renewal: the job is already claimed (name is in running/).
+/// Returns true if the job failed.
+fn run_one_job(dir: str, name: str, lease: int, worker_id: int) -> bool {
+    // Read the job
+    let job_path = dir + "/running/" + name
+    let job = read_job(job_path) else |_| { return false }
+    // Update with runner info
+    let now = time.unix_ms()
+    let lease_ms = now + lease * 1000
+    update_job(dir, name, "worker-{worker_id}", lease_ms, now) else |_| { return false }
+    // Build the command
+    var cmd = process.command(job.cmd[0])
+    var i = 1
+    while i < job.cmd.len {
+        process.push_arg(mut cmd, job.cmd[i])
+        i = i + 1
+    }
+    // Create log file
+    let log_path = dir + "/log/" + job.id + ".log"
+    var log_f = fs.create(log_path) else |_| { return false }
+    // Set stdout and stderr to the log file
+    process.set_stdout(mut cmd, log_f)
+    process.set_stderr(mut cmd, log_f)
+    // Run the command (blocks until the child ends)
+    let exit = process.run(cmd) else |e| match e {
+        not_found => {
+            fs.close(take log_f) else |_| {}
+            let ended = time.unix_ms()
+            finish_job(dir, name, "failed", 127, ended) else |_| {}
+            return true
+        },
+        denied => {
+            fs.close(take log_f) else |_| {}
+            let ended = time.unix_ms()
+            finish_job(dir, name, "failed", 126, ended) else |_| {}
+            return true
+        },
+        signal => {
+            fs.close(take log_f) else |_| {}
+            let ended = time.unix_ms()
+            finish_job(dir, name, "killed", 130, ended) else |_| {}
+            return true
+        },
+        io => {
+            fs.close(take log_f) else |_| {}
+            let ended = time.unix_ms()
+            finish_job(dir, name, "failed", 1, ended) else |_| {}
+            return true
+        },
+        invalid => {
+            fs.close(take log_f) else |_| {}
+            let ended = time.unix_ms()
+            finish_job(dir, name, "failed", 1, ended) else |_| {}
+            return true
+        },
+        unsupported => {
+            fs.close(take log_f) else |_| {}
+            let ended = time.unix_ms()
+            finish_job(dir, name, "failed", 1, ended) else |_| {}
+            return true
+        },
+    }
+    // Close the log file
+    fs.close(take log_f) else |_| {}
+    // Finish the job
+    let ended_ms = time.unix_ms()
+    let status = if exit == 0 { "ok" } else { "failed" }
+    finish_job(dir, name, status, exit, ended_ms) else |_| { return false }
+    exit != 0
+}
+
+/// Run jobs with N workers.
+fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: bool) -> !int {
+    if !queue_check(dir) {
+        print("jobq: " + dir + ": not a queue")
+        return 2
+    }
+    var any_failed = false
+    var count = 0
+    var worker_id = 0
+    while true {
+        // Reclaim expired leases before claiming
+        let _ = reclaim_expired(dir, max_tries) else 0
+        let name = claim_job(dir) else |e| match e {
+            parse => { continue },
+            not_found => { continue },
+            denied => {
+                print("jobq: cannot claim job")
+                return 2
+            },
+            io => { continue },
+        }
+        if name.len == 0 {
+            break
+        }
+        // Run the job with lease renewal
+        let failed = run_one_job(dir, name, lease, worker_id)
+        if failed {
+            any_failed = true
+        }
+        count = count + 1
+        worker_id = worker_id + 1
+    }
+    if count == 0 {
+        print("jobq: no jobs to run")
+        return 0
+    }
+    print("jobq: ran {count} jobs")
+    if any_failed {
+        return 1
+    }
+    0
+}
+
+/// List jobs.
+fn cmd_ls(dir: str, state: str) -> !int {
+    if !queue_check(dir) {
+        print("jobq: " + dir + ": not a queue")
+        return 2
+    }
+    let jobs = list_jobs(dir, state) else |e| {
+        print("jobq: cannot list jobs: {e}")
+        return 2
+    }
+    if jobs.len == 0 {
+        print("jobq: no jobs found")
+        return 0
+    }
+    for entry in jobs {
+        let (id, state_name, tries, exit, started, ended, cmd_text) = entry
+        print("{id} {state_name} {tries} {exit} {started} {ended} {cmd_text}")
+    }
+    0
+}
+
+/// Show a job.
+fn cmd_show(dir: str, id: str) -> !int {
+    let (content, log) = show_job(dir, id) else |_| {
+        print("jobq: job not found: " + id)
+        return 2
+    }
+    print(content)
+    if log.len > 0 {
+        print("--- log ---")
+        print(log)
+    }
+    0
+}
+
+/// Retry a job.
+fn cmd_retry(dir: str, id: str, failed: bool) -> !int {
+    if failed {
+        let count = retry_all_failed(dir) else |_| {
+            print("jobq: cannot retry failed jobs")
+            return 2
+        }
+        print("jobq: retried {count} jobs")
+        return 0
+    }
+    // Find the job by id in failed/
+    let names = fs.read_dir(dir + "/failed") else List[str]()
+    for name in names {
+        let job_path = dir + "/failed/" + name
+        let job = read_job(job_path) else |_| { continue }
+        if job.id == id {
+            retry_job(dir, name) else |_| {
+                print("jobq: cannot retry job: " + id)
+                return 2
+            }
+            print("jobq: retried job " + id)
+            return 0
+        }
+    }
+    print("jobq: job not found: " + id)
+    2
+}
+
+/// Print stats.
+fn cmd_stats(dir: str) -> !int {
+    if !queue_check(dir) {
+        print("jobq: " + dir + ": not a queue")
+        return 2
+    }
+    let stats = compute_stats(dir) else |_| {
+        print("jobq: cannot compute stats")
+        return 2
+    }
+    print("pending: {stats.pending}")
+    print("running: {stats.running}")
+    print("done: {stats.done}")
+    print("failed: {stats.failed}")
+    print("mean: {stats.mean_ms}ms")
+    print("p95: {stats.p95_ms}ms")
+    0
+}
+
+fn main() -> !int {
+    let args = env.args()
+    if args.len == 0 {
+        return usage()
+    }
+    if args[0] == "--help" {
+        return usage()
+    }
+    if args[0] == "init" {
+        if args.len < 2 {
+            print("jobq: init requires a directory")
+            return 2
+        }
+        return cmd_init(args[1])
+    }
+    if args[0] == "add" {
+        let (dir, rest) = parse_dir(args[1..])
+        if has_help(rest) {
+            return usage()
+        }
+        let (file, has_file) = parse_file(rest)
+        if has_file {
+            return cmd_add_file(dir, file)
+        }
+        let cmd_args = args_after_sep(rest)
+        return cmd_add(dir, cmd_args)
+    }
+    if args[0] == "run" {
+        let (dir, rest) = parse_dir(args[1..])
+        if has_help(rest) {
+            return usage()
+        }
+        let (jobs, rest2) = parse_jobs(rest)
+        let (lease, rest3) = parse_lease(rest2)
+        let (max_tries, rest4) = parse_max_tries(rest3)
+        let (follow, rest5) = parse_follow(rest4)
+        let (once, _) = parse_once(rest5)
+        return cmd_run(dir, jobs, lease, max_tries, follow, once)
+    }
+    if args[0] == "ls" {
+        let (dir, rest) = parse_dir(args[1..])
+        if has_help(rest) {
+            return usage()
+        }
+        let (state, _) = parse_state(rest)
+        return cmd_ls(dir, state)
+    }
+    if args[0] == "show" {
+        let (dir, rest) = parse_dir(args[1..])
+        if has_help(rest) {
+            return usage()
+        }
+        if rest.len < 1 {
+            print("jobq: show requires an ID")
+            return 2
+        }
+        return cmd_show(dir, rest[0])
+    }
+    if args[0] == "retry" {
+        let (dir, rest) = parse_dir(args[1..])
+        if has_help(rest) {
+            return usage()
+        }
+        let (failed, rest2) = parse_failed(rest)
+        if failed {
+            return cmd_retry(dir, "", true)
+        }
+        if rest2.len < 1 {
+            print("jobq: retry requires an ID or --failed")
+            return 2
+        }
+        return cmd_retry(dir, rest2[0], false)
+    }
+    if args[0] == "stats" {
+        let (dir, _) = parse_dir(args[1..])
+        if has_help(args[1..]) {
+            return usage()
+        }
+        return cmd_stats(dir)
+    }
+    print("jobq: unknown command: " + args[0])
+    2
+}

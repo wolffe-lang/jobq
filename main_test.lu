@@ -1,0 +1,304 @@
+//! check: run(exit=0)
+//!
+//! Black-box tests for jobq: CLI surface, quoting, claim semantics,
+//! retry, stats, and concurrent runners.
+
+use std.fs
+use std.strbuf
+use std.time
+
+/// Build a minimal job file in a directory.
+fn write_test_job(dir: str, id: int, cmd: List[str]) -> () ! {not_found, denied, io} {
+    let name = "{id:0>6}" + "-" + "{id}" + ".job"
+    let path = dir + "/queue/" + name
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + "{id}" + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(cmd) + "\n")
+    strbuf.push_str(mut b, "added=" + "{time.unix_ms()}" + "\n")
+    strbuf.push_str(mut b, "tries=0\n")
+    fs.write_text(path, strbuf.to_str(b))?
+}
+
+/// Test that two in-process claimers over a temp directory never claim the same job.
+fn test_claim_exclusivity() -> !int {
+    let dir = "/tmp/jobq-test-claim-" + "{time.unix_ms()}"
+    queue_init(dir) else |_| { return 1 }
+    // Write 10 jobs
+    var i = 1
+    while i <= 10 {
+        let cmd = List[str]()
+        (mut cmd).push("echo")
+        (mut cmd).push("{i}")
+        write_test_job(dir, i, cmd) else |_| { return 1 }
+        i = i + 1
+    }
+    // Two claimers race
+    var claimed_a = List[str]()
+    var claimed_b = List[str]()
+    var j = 0
+    while j < 10 {
+        let name_a = claim_job(dir) else |_| { "" }
+        let name_b = claim_job(dir) else |_| { "" }
+        if name_a.len > 0 {
+            (mut claimed_a).push(name_a)
+        }
+        if name_b.len > 0 {
+            (mut claimed_b).push(name_b)
+        }
+        j = j + 1
+    }
+    // Check no duplicates
+    var duplicates = 0
+    for a in claimed_a {
+        for b in claimed_b {
+            if a == b {
+                duplicates = duplicates + 1
+            }
+        }
+    }
+    if duplicates > 0 {
+        print("FAIL: claim_exclusivity — {duplicates} duplicates")
+        return 1
+    }
+    // Check all 10 were claimed
+    if claimed_a.len + claimed_b.len != 10 {
+        print("FAIL: claim_exclusivity — only {claimed_a.len + claimed_b.len} claimed")
+        return 1
+    }
+    print("ok: claim_exclusivity")
+    0
+}
+
+/// Test that retry moves a failed job back to the queue.
+fn test_retry() -> !int {
+    let dir = "/tmp/jobq-test-retry-" + "{time.unix_ms()}"
+    queue_init(dir) else |_| { return 1 }
+    // Write a job and move it to failed/
+    let cmd = List[str]()
+    (mut cmd).push("echo")
+    (mut cmd).push("test")
+    write_test_job(dir, 1, cmd) else |_| { return 1 }
+    // Move to failed/
+    let from = dir + "/queue/000001-1.job"
+    let to = dir + "/failed/000001-1.job"
+    fs.move_file(from, to) else |_| { return 1 }
+    // Retry
+    let count = retry_all_failed(dir) else |_| { return 1 }
+    if count != 1 {
+        print("FAIL: retry — expected 1, got {count}")
+        return 1
+    }
+    // Check it's back in queue/
+    let names = fs.read_dir(dir + "/queue") else List[str]()
+    if names.len != 1 {
+        print("FAIL: retry — queue has {names.len} files")
+        return 1
+    }
+    print("ok: retry")
+    0
+}
+
+/// Test that stats computes correctly.
+fn test_stats() -> !int {
+    let dir = "/tmp/jobq-test-stats-" + "{time.unix_ms()}"
+    queue_init(dir) else |_| { return 1 }
+    // Write 3 jobs in queue/
+    var i = 1
+    while i <= 3 {
+        let cmd = List[str]()
+        (mut cmd).push("echo")
+        (mut cmd).push("{i}")
+        write_test_job(dir, i, cmd) else |_| { return 1 }
+        i = i + 1
+    }
+    // Write 2 jobs in done/
+    i = 4
+    while i <= 5 {
+        let name = "{i:0>6}" + "-" + "{i}" + ".job"
+        let path = dir + "/done/" + name
+        var b = strbuf.new()
+        strbuf.push_str(mut b, "id=" + "{i}" + "\n")
+        strbuf.push_str(mut b, "cmd=[\"echo\", \"{i}\"]\n")
+        strbuf.push_str(mut b, "added=1000\n")
+        strbuf.push_str(mut b, "tries=0\n")
+        strbuf.push_str(mut b, "runner=test\n")
+        strbuf.push_str(mut b, "lease=2000\n")
+        strbuf.push_str(mut b, "started=1000\n")
+        strbuf.push_str(mut b, "status=ok\n")
+        strbuf.push_str(mut b, "ended=1010\n")
+        strbuf.push_str(mut b, "exit=0\n")
+        fs.write_text(path, strbuf.to_str(b)) else |_| { return 1 }
+        i = i + 1
+    }
+    // Write 1 job in failed/
+    let name = "000006-6.job"
+    let path = dir + "/failed/" + name
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=6\n")
+    strbuf.push_str(mut b, "cmd=[\"echo\", \"fail\"]\n")
+    strbuf.push_str(mut b, "added=1000\n")
+    strbuf.push_str(mut b, "tries=0\n")
+    strbuf.push_str(mut b, "runner=test\n")
+    strbuf.push_str(mut b, "lease=2000\n")
+    strbuf.push_str(mut b, "started=1000\n")
+    strbuf.push_str(mut b, "status=failed\n")
+    strbuf.push_str(mut b, "ended=1005\n")
+    strbuf.push_str(mut b, "exit=1\n")
+    fs.write_text(path, strbuf.to_str(b)) else |_| { return 1 }
+    // Compute stats
+    let stats = compute_stats(dir) else |_| { return 1 }
+    if stats.pending != 3 {
+        print("FAIL: stats — expected 3 pending, got {stats.pending}")
+        return 1
+    }
+    if stats.done != 2 {
+        print("FAIL: stats — expected 2 done, got {stats.done}")
+        return 1
+    }
+    if stats.failed != 1 {
+        print("FAIL: stats — expected 1 failed, got {stats.failed}")
+        return 1
+    }
+    if stats.mean_ms != 10 {
+        print("FAIL: stats — expected mean 10ms, got {stats.mean_ms}ms")
+        return 1
+    }
+    print("ok: stats")
+    0
+}
+
+/// Test that split_quoted handles quoted arguments correctly.
+fn test_quoting() -> !int {
+    let line1 = "echo \"a b\" 'x y' hello"
+    let parts1 = split_quoted(line1)
+    if parts1.len != 4 {
+        print("FAIL: quoting — expected 4 parts, got {parts1.len}")
+        return 1
+    }
+    if parts1[0] != "echo" {
+        print("FAIL: quoting — parts1[0] = {parts1[0]}")
+        return 1
+    }
+    if parts1[1] != "a b" {
+        print("FAIL: quoting — parts1[1] = {parts1[1]}")
+        return 1
+    }
+    if parts1[2] != "x y" {
+        print("FAIL: quoting — parts1[2] = {parts1[2]}")
+        return 1
+    }
+    if parts1[3] != "hello" {
+        print("FAIL: quoting — parts1[3] = {parts1[3]}")
+        return 1
+    }
+    print("ok: quoting")
+    0
+}
+
+/// Test that a job file can be written and read back with all fields equal.
+fn test_round_trip() -> !int {
+    let dir = "/tmp/jobq-test-roundtrip-" + "{time.unix_ms()}"
+    queue_init(dir) else |_| { return 1 }
+    // Write a job file with all fields
+    let name = "000001-1.job"
+    let path = dir + "/queue/" + name
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=1\n")
+    strbuf.push_str(mut b, "cmd=[\"echo\", \"hello\"]\n")
+    strbuf.push_str(mut b, "added=1000\n")
+    strbuf.push_str(mut b, "tries=2\n")
+    strbuf.push_str(mut b, "runner=test\n")
+    strbuf.push_str(mut b, "lease=2000\n")
+    strbuf.push_str(mut b, "status=ok\n")
+    strbuf.push_str(mut b, "started=1500\n")
+    strbuf.push_str(mut b, "ended=1600\n")
+    strbuf.push_str(mut b, "exit=0\n")
+    fs.write_text(path, strbuf.to_str(b)) else |_| { return 1 }
+    // Read it back
+    let job = read_job(path) else |_| { return 1 }
+    if job.id != "1" {
+        print("FAIL: round_trip — id = {job.id}")
+        return 1
+    }
+    if job.cmd.len != 2 {
+        print("FAIL: round_trip — cmd.len = {job.cmd.len}")
+        return 1
+    }
+    if job.cmd[0] != "echo" {
+        print("FAIL: round_trip — cmd[0] = {job.cmd[0]}")
+        return 1
+    }
+    if job.cmd[1] != "hello" {
+        print("FAIL: round_trip — cmd[1] = {job.cmd[1]}")
+        return 1
+    }
+    if job.added != 1000 {
+        print("FAIL: round_trip — added = {job.added}")
+        return 1
+    }
+    if job.tries != 2 {
+        print("FAIL: round_trip — tries = {job.tries}")
+        return 1
+    }
+    if job.runner != "test" {
+        print("FAIL: round_trip — runner = {job.runner}")
+        return 1
+    }
+    if job.lease != 2000 {
+        print("FAIL: round_trip — lease = {job.lease}")
+        return 1
+    }
+    if job.status != "ok" {
+        print("FAIL: round_trip — status = {job.status}")
+        return 1
+    }
+    if job.started != 1500 {
+        print("FAIL: round_trip — started = {job.started}")
+        return 1
+    }
+    if job.ended != 1600 {
+        print("FAIL: round_trip — ended = {job.ended}")
+        return 1
+    }
+    if job.exit != 0 {
+        print("FAIL: round_trip — exit = {job.exit}")
+        return 1
+    }
+    print("ok: round_trip")
+    0
+}
+
+/// Test that claim_job rejects malformed files (they stay in queue/).
+fn test_claim_rejects_malformed() -> !int {
+    let dir = "/tmp/jobq-test-claim-malformed-" + "{time.unix_ms()}"
+    queue_init(dir) else |_| { return 1 }
+    // Write a malformed job file
+    fs.write_text(dir + "/queue/000001-1.job", "this is not valid\n") else |_| { return 1 }
+    // Write a valid job file
+    let cmd = List[str]()
+    (mut cmd).push("echo")
+    (mut cmd).push("test")
+    write_test_job(dir, 2, cmd) else |_| { return 1 }
+    // Claim — should skip the malformed file and claim the valid one
+    let name = claim_job(dir) else |_| { "" }
+    if name.len == 0 {
+        print("FAIL: claim_rejects_malformed — no job claimed")
+        return 1
+    }
+    if name != "000002-2.job" {
+        print("FAIL: claim_rejects_malformed — claimed {name}")
+        return 1
+    }
+    // Check the malformed file is still in queue/
+    let queue_names = fs.read_dir(dir + "/queue") else List[str]()
+    if queue_names.len != 1 {
+        print("FAIL: claim_rejects_malformed — queue has {queue_names.len} files")
+        return 1
+    }
+    if queue_names[0] != "000001-1.job" {
+        print("FAIL: claim_rejects_malformed — queue has {queue_names[0]}")
+        return 1
+    }
+    print("ok: claim_rejects_malformed")
+    0
+}

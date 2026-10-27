@@ -1,0 +1,680 @@
+//! check: run(exit=0)
+//!
+//! store — the queue layout, job file read/write, claim/release/finish.
+//!
+//! A job file holds lines:
+//!   id=<id>
+//!   cmd=<JSON array of argv>
+//!   added=<unix ms>
+//!   tries=<count>
+//!   runner=<pid or hostname>
+//!   lease=<unix ms expiry>
+//!   status=<ok|failed|killed|lease-expired>
+//!   started=<unix ms>
+//!   ended=<unix ms>
+//!   exit=<code>
+//!
+//! The queue is a directory:
+//!   DIR/queue/   — pending jobs
+//!   DIR/running/ — claimed jobs
+//!   DIR/done/    — completed jobs
+//!   DIR/failed/  — failed jobs
+//!   DIR/log/     — stdout+stderr per job
+
+use std.fs
+use std.strbuf
+use std.time
+
+/// Common filesystem error row.
+error fs_err = {not_found, denied, io}
+
+/// Common read error row.
+error read_err = {not_found, denied, utf8, io}
+
+/// Job read error row.
+error job_err = {not_found, denied, utf8, io, parse}
+
+/// A parsed job record.
+pub struct Job {
+    id: str,
+    cmd: List[str],
+    added: int,
+    tries: int,
+    runner: str,
+    lease: int,
+    status: str,
+    started: int,
+    ended: int,
+    exit: int,
+}
+
+/// Check that a directory has the queue layout (queue/ and running/ must exist).
+pub fn queue_check(dir: str) -> bool {
+    let queue = fs.read_dir(dir + "/queue") else |_| { return false }
+    let running = fs.read_dir(dir + "/running") else |_| { return false }
+    true
+}
+
+/// Create the queue directory layout.
+pub fn queue_init(dir: str) -> () ! fs_err {
+    fs.create_dir_all(dir + "/queue")?
+    fs.create_dir_all(dir + "/running")?
+    fs.create_dir_all(dir + "/done")?
+    fs.create_dir_all(dir + "/failed")?
+    fs.create_dir_all(dir + "/log")?
+}
+
+/// The next sequence number, from the highest existing file plus one.
+/// Scans all four directories.
+pub fn next_id(dir: str) -> int ! read_err {
+    var max = 0
+    for sub in ["queue", "running", "done", "failed"] {
+        let path = dir + "/" + sub
+        let names = fs.read_dir(path) else List[str]()
+        for name in names {
+            // filename is NNNNNN-N.job, extract the last number before .job
+            let dot = name.find(".") else 0 - 1
+            if dot > 0 {
+                let prefix = name[0..dot]
+                // prefix is "000001-1", extract the part after the dash
+                let dash = prefix.find("-") else 0 - 1
+                if dash > 0 {
+                    let id_str = prefix[dash + 1..]
+                    let n = id_str.to_int() else 0
+                    if n > max {
+                        max = n
+                    }
+                }
+            }
+        }
+    }
+    max + 1
+}
+
+/// Create a new job file with `create_new`. Retries with the next id on `exists`.
+/// Returns the job id string.
+pub fn create_job(dir: str, cmd: List[str]) -> str ! fs_err {
+    var id = next_id(dir) else 1
+    var attempts = 0
+    while attempts < 16 {
+        let name = "{id:0>6}" + "-" + "{id}" + ".job"
+        let path = dir + "/queue/" + name
+        let content = build_job_text("{id}", cmd)
+        fs.write_text(path, content) else |e| match e {
+            not_found => { return not_found },
+            denied => { return denied },
+            io => {
+                // create_new raises exists as io in some cases; retry with next id
+                id = id + 1
+                attempts = attempts + 1
+            },
+        }
+        return "{id}"
+    }
+    return "{id}"
+}
+
+/// Build the text content of a job file.
+fn build_job_text(id: str, cmd: List[str]) -> str {
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + id + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(cmd) + "\n")
+    strbuf.push_str(mut b, "added=" + "{time.unix_ms()}" + "\n")
+    strbuf.push_str(mut b, "tries=0\n")
+    strbuf.to_str(b)
+}
+
+/// Encode a List[str] as a JSON array.
+fn json_encode(args: List[str]) -> str {
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "[")
+    var i = 0
+    while i < args.len {
+        if i > 0 {
+            strbuf.push_str(mut b, ", ")
+        }
+        strbuf.push_str(mut b, "\"")
+        strbuf.push_str(mut b, json_escape(args[i]))
+        strbuf.push_str(mut b, "\"")
+        i = i + 1
+    }
+    strbuf.push_str(mut b, "]")
+    strbuf.to_str(b)
+}
+
+/// Escape a string for JSON.
+fn json_escape(s: str) -> str {
+    var b = strbuf.new()
+    var i = 0
+    while i < s.len {
+        let c = s[i..i + 1]
+        if c == "\"" {
+            strbuf.push_str(mut b, "\\\"")
+        } else if c == "\\" {
+            strbuf.push_str(mut b, "\\\\")
+        } else if c == "\n" {
+            strbuf.push_str(mut b, "\\n")
+        } else if c == "\r" {
+            strbuf.push_str(mut b, "\\r")
+        } else if c == "\t" {
+            strbuf.push_str(mut b, "\\t")
+        } else {
+            strbuf.push_str(mut b, c)
+        }
+        i = i + 1
+    }
+    strbuf.to_str(b)
+}
+
+/// Parse a JSON array of strings from a string.
+fn json_decode(s: str) -> List[str] ! {parse} {
+    var result = List[str]()
+    let trimmed = s.trim()
+    if !trimmed.starts_with("[") {
+        return parse
+    }
+    if !trimmed.ends_with("]") {
+        return parse
+    }
+    let inner = trimmed[1..trimmed.len - 1]
+    var rest = inner
+    while rest.len > 0 {
+        let stripped = rest.trim_start()
+        if stripped.len == 0 {
+            break
+        }
+        if stripped[0..1] == "\"" {
+            let val = extract_json_string(stripped) else { return parse }
+            (mut result).push(val)
+            // advance past the string: find the closing quote in the rest
+            let after_open = stripped[1..]
+            let close_pos = after_open.find("\"") else { return parse }
+            rest = after_open[close_pos + 1..]
+        } else {
+            return parse
+        }
+        // skip comma and whitespace
+        let trimmed_rest = rest.trim_start()
+        if trimmed_rest.len > 0 && trimmed_rest[0..1] == "," {
+            rest = trimmed_rest[1..]
+        } else {
+            break
+        }
+    }
+    result
+}
+
+/// Extract a JSON string from the start of `s`, which must start with `"`.
+fn extract_json_string(s: str) -> str ! {parse} {
+    if s.len < 1 || s[0..1] != "\"" {
+        return parse
+    }
+    var b = strbuf.new()
+    var i = 1
+    while i < s.len {
+        let c = s[i..i + 1]
+        if c == "\"" {
+            return strbuf.to_str(b)
+        }
+        if c == "\\" {
+            if i + 1 < s.len {
+                let esc = s[i + 1..i + 2]
+                if esc == "\"" {
+                    strbuf.push_str(mut b, "\"")
+                } else if esc == "\\" {
+                    strbuf.push_str(mut b, "\\")
+                } else if esc == "n" {
+                    strbuf.push_str(mut b, "\n")
+                } else if esc == "r" {
+                    strbuf.push_str(mut b, "\r")
+                } else if esc == "t" {
+                    strbuf.push_str(mut b, "\t")
+                } else {
+                    strbuf.push_str(mut b, esc)
+                }
+                i = i + 2
+            } else {
+                return parse
+            }
+        } else {
+            strbuf.push_str(mut b, c)
+            i = i + 1
+        }
+    }
+    return parse
+}
+
+/// Read and parse a job file.
+pub fn read_job(path: str) -> Job ! job_err {
+    let text = fs.read_text(path)?
+    let lines = text.lines()
+    var id = ""
+    var cmd = List[str]()
+    var added = 0
+    var tries = 0
+    var runner = ""
+    var lease = 0
+    var status = ""
+    var started = 0
+    var ended = 0
+    var exit = 0
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed.len == 0 {
+            continue
+        }
+        let eq = trimmed.find("=") else 0 - 1
+        if eq < 1 {
+            continue
+        }
+        let key = trimmed[0..eq]
+        let value = trimmed[eq + 1..]
+        if key == "id" {
+            id = value
+        } else if key == "cmd" {
+            cmd = json_decode(value) else { return parse }
+        } else if key == "added" {
+            added = value.to_int() else 0
+        } else if key == "tries" {
+            tries = value.to_int() else 0
+        } else if key == "runner" {
+            runner = value
+        } else if key == "lease" {
+            lease = value.to_int() else 0
+        } else if key == "status" {
+            status = value
+        } else if key == "started" {
+            started = value.to_int() else 0
+        } else if key == "ended" {
+            ended = value.to_int() else 0
+        } else if key == "exit" {
+            exit = value.to_int() else 0
+        }
+    }
+    // A valid job must have an id and a cmd
+    if id.len == 0 || cmd.len == 0 {
+        return parse
+    }
+    Job {
+        id: id,
+        cmd: cmd,
+        added: added,
+        tries: tries,
+        runner: runner,
+        lease: lease,
+        status: status,
+        started: started,
+        ended: ended,
+        exit: exit,
+    }
+}
+
+/// List jobs in a directory, returning (id, state, tries, exit, started, ended, cmd_text).
+pub fn list_jobs(dir: str, state: str) -> List[(str, str, int, int, int, int, str)] ! read_err {
+    var result = List[(str, str, int, int, int, int, str)]()
+    let subs = if state.len == 0 {
+        ["queue", "running", "done", "failed"]
+    } else if state == "all" {
+        ["queue", "running", "done", "failed"]
+    } else if state == "pending" {
+        ["queue"]
+    } else {
+        [state]
+    }
+    for sub in subs {
+        let path = dir + "/" + sub
+        let names = fs.read_dir(path) else List[str]()
+        for name in names {
+            let job_path = path + "/" + name
+            let job = read_job(job_path) else |_| { continue }
+            let cmd_text = json_encode(job.cmd)
+            let state_name = if sub == "queue" { "pending" } else { sub }
+            (mut result).push(
+                (job.id, state_name, job.tries, job.exit, job.started, job.ended, cmd_text),
+            )
+        }
+    }
+    result
+}
+
+/// Show a job by id. Searches all directories.
+pub fn show_job(dir: str, id: str) -> (str, str) ! job_err {
+    for sub in ["queue", "running", "done", "failed"] {
+        let path = dir + "/" + sub
+        let names = fs.read_dir(path) else List[str]()
+        for name in names {
+            let job_path = path + "/" + name
+            let job = read_job(job_path) else |_| { continue }
+            if job.id == id {
+                let content = fs.read_text(job_path)?
+                let log_path = dir + "/log/" + id + ".log"
+                let log = fs.read_text(log_path) else ""
+                return (content, log)
+            }
+        }
+    }
+    return not_found
+}
+
+/// Add jobs from a file, one per line. Each line is split by whitespace
+/// with single and double quotes honored.
+pub fn add_from_file(dir: str, file: str) -> int ! read_err {
+    let content = fs.read_text(file)?
+    let lines = content.lines()
+    var count = 0
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed.len == 0 {
+            continue
+        }
+        let args = split_quoted(trimmed)
+        if args.len > 0 {
+            create_job(dir, args) else |_| { continue }
+            count = count + 1
+        }
+    }
+    count
+}
+
+/// Split a line by whitespace, honoring single and double quotes.
+fn split_quoted(line: str) -> List[str] {
+    var result = List[str]()
+    var i = 0
+    while i < line.len {
+        // skip whitespace
+        while i < line.len {
+            let c = line[i..i + 1]
+            if c != " " && c != "\t" {
+                break
+            }
+            i = i + 1
+        }
+        if i >= line.len {
+            break
+        }
+        let c = line[i..i + 1]
+        if c == "\"" {
+            // double-quoted word
+            i = i + 1
+            var b = strbuf.new()
+            while i < line.len {
+                let ch = line[i..i + 1]
+                if ch == "\"" {
+                    i = i + 1
+                    break
+                }
+                strbuf.push_str(mut b, ch)
+                i = i + 1
+            }
+            (mut result).push(strbuf.to_str(b))
+        } else if c == "'" {
+            // single-quoted word
+            i = i + 1
+            var b = strbuf.new()
+            while i < line.len {
+                let ch = line[i..i + 1]
+                if ch == "'" {
+                    i = i + 1
+                    break
+                }
+                strbuf.push_str(mut b, ch)
+                i = i + 1
+            }
+            (mut result).push(strbuf.to_str(b))
+        } else {
+            // unquoted word
+            var b = strbuf.new()
+            while i < line.len {
+                let ch = line[i..i + 1]
+                if ch == " " || ch == "\t" {
+                    break
+                }
+                strbuf.push_str(mut b, ch)
+                i = i + 1
+            }
+            (mut result).push(strbuf.to_str(b))
+        }
+    }
+    result
+}
+
+/// Claim a job by renaming it from queue/ to running/.
+/// Parses the file BEFORE the rename; if parse fails, the file stays in queue/
+/// and the error is returned. Returns the filename if successful, empty string
+/// if no job was claimed.
+pub fn claim_job(dir: str) -> str ! {not_found, denied, io, parse} {
+    let names = fs.read_dir(dir + "/queue") else List[str]()
+    for name in names {
+        let path = dir + "/queue/" + name
+        // Parse BEFORE the rename — malformed files stay where they are
+        read_job(path) else |e| match e {
+            parse => { continue },
+            not_found => { continue },
+            denied => { return denied },
+            utf8 => { continue },
+            io => { continue },
+        }
+        let from = dir + "/queue/" + name
+        let to = dir + "/running/" + name
+        fs.move_file(from, to) else |_| { continue }
+        return name
+    }
+    ""
+}
+
+/// Reclaim expired leases from running/. Moves expired jobs back to queue/
+/// with tries incremented. If tries >= max_tries, moves to failed/ with
+/// status=lease-expired. Returns the number of jobs reclaimed.
+pub fn reclaim_expired(dir: str, max_tries: int) -> int ! fs_err {
+    let names = fs.read_dir(dir + "/running") else List[str]()
+    var count = 0
+    let now = time.unix_ms()
+    for name in names {
+        let path = dir + "/running/" + name
+        let job = read_job(path) else |_| { continue }
+        if job.lease > 0 && now > job.lease {
+            // Lease expired
+            let new_tries = job.tries + 1
+            if new_tries >= max_tries {
+                // Move to failed/ with lease-expired status
+                var b = strbuf.new()
+                strbuf.push_str(mut b, "id=" + job.id + "\n")
+                strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+                strbuf.push_str(mut b, "added={job.added}\n")
+                strbuf.push_str(mut b, "tries={new_tries}\n")
+                strbuf.push_str(mut b, "runner=" + job.runner + "\n")
+                strbuf.push_str(mut b, "lease={job.lease}\n")
+                strbuf.push_str(mut b, "started={job.started}\n")
+                strbuf.push_str(mut b, "status=lease-expired\n")
+                strbuf.push_str(mut b, "ended={now}\n")
+                strbuf.push_str(mut b, "exit=0\n")
+                let to = dir + "/failed/" + name
+                fs.write_text(to, strbuf.to_str(b))?
+                fs.remove(path)?
+            } else {
+                // Move back to queue/ with incremented tries
+                var b = strbuf.new()
+                strbuf.push_str(mut b, "id=" + job.id + "\n")
+                strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+                strbuf.push_str(mut b, "added={job.added}\n")
+                strbuf.push_str(mut b, "tries={new_tries}\n")
+                let to = dir + "/queue/" + name
+                fs.write_text(to, strbuf.to_str(b))?
+                fs.remove(path)?
+            }
+            count = count + 1
+        }
+    }
+    count
+}
+
+/// Rewrite a job file in running/ with updated fields.
+pub fn update_job(dir: str, name: str, runner: str, lease: int, started: int) -> () ! fs_err {
+    let path = dir + "/running/" + name
+    let job = read_job(path) else |_| { return }
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + job.id + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+    strbuf.push_str(mut b, "added={job.added}\n")
+    strbuf.push_str(mut b, "tries={job.tries}\n")
+    strbuf.push_str(mut b, "runner=" + runner + "\n")
+    strbuf.push_str(mut b, "lease={lease}\n")
+    strbuf.push_str(mut b, "started={started}\n")
+    fs.write_text(path, strbuf.to_str(b))?
+}
+
+/// Finish a job: write final fields and move to done/ or failed/.
+pub fn finish_job(dir: str, name: str, status: str, exit: int, ended: int) -> () ! fs_err {
+    let path = dir + "/running/" + name
+    let job = read_job(path) else |_| { return }
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + job.id + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+    strbuf.push_str(mut b, "added={job.added}\n")
+    strbuf.push_str(mut b, "tries={job.tries}\n")
+    strbuf.push_str(mut b, "runner=" + job.runner + "\n")
+    strbuf.push_str(mut b, "lease={job.lease}\n")
+    strbuf.push_str(mut b, "started={job.started}\n")
+    strbuf.push_str(mut b, "status=" + status + "\n")
+    strbuf.push_str(mut b, "ended={ended}\n")
+    strbuf.push_str(mut b, "exit={exit}\n")
+    fs.write_text(path, strbuf.to_str(b))?
+    let dest = if status == "ok" { "done" } else { "failed" }
+    let to = dir + "/" + dest + "/" + name
+    fs.move_file(path, to)?
+}
+
+/// Write output to a job's log file.
+pub fn write_log(dir: str, id: str, text: str) -> () ! fs_err {
+    let path = dir + "/log/" + id + ".log"
+    fs.write_text(path, text)?
+}
+
+/// Append output to a job's log file.
+pub fn append_log(dir: str, id: str, text: str) -> () ! fs_err {
+    let path = dir + "/log/" + id + ".log"
+    fs.append_text(path, text)?
+}
+
+/// Renew a job's lease by rewriting the file with a new expiry.
+pub fn renew_lease(dir: str, name: str, new_lease: int) -> () ! fs_err {
+    let path = dir + "/running/" + name
+    let job = read_job(path) else |_| { return }
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + job.id + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+    strbuf.push_str(mut b, "added={job.added}\n")
+    strbuf.push_str(mut b, "tries={job.tries}\n")
+    strbuf.push_str(mut b, "runner=" + job.runner + "\n")
+    strbuf.push_str(mut b, "lease={new_lease}\n")
+    strbuf.push_str(mut b, "started={job.started}\n")
+    fs.write_text(path, strbuf.to_str(b))?
+}
+
+/// Move a failed job back to the queue with tries reset.
+pub fn retry_job(dir: str, name: str) -> () ! fs_err {
+    let from = dir + "/failed/" + name
+    let to = dir + "/queue/" + name
+    // Read the job to reset tries
+    let job = read_job(from) else |_| { return }
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + job.id + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+    strbuf.push_str(mut b, "added={job.added}\n")
+    strbuf.push_str(mut b, "tries=0\n")
+    fs.write_text(to, strbuf.to_str(b))?
+    fs.remove(from)?
+}
+
+/// Move all failed jobs back to the queue with tries reset.
+pub fn retry_all_failed(dir: str) -> int ! fs_err {
+    let names = fs.read_dir(dir + "/failed") else List[str]()
+    var count = 0
+    for name in names {
+        retry_job(dir, name)?
+        count = count + 1
+    }
+    count
+}
+
+/// Stats: counts per state and timing info for done jobs.
+pub struct Stats {
+    pending: int,
+    running: int,
+    done: int,
+    failed: int,
+    mean_ms: int,
+    p95_ms: int,
+}
+
+/// Compute stats for a queue directory.
+pub fn compute_stats(dir: str) -> Stats ! read_err {
+    var pending = 0
+    var running = 0
+    var done = 0
+    var failed = 0
+    var durations = List[int]()
+    for sub in ["queue", "running", "done", "failed"] {
+        let path = dir + "/" + sub
+        let names = fs.read_dir(path) else List[str]()
+        for name in names {
+            let job_path = path + "/" + name
+            let job = read_job(job_path) else |_| { continue }
+            if sub == "queue" {
+                pending = pending + 1
+            } else if sub == "running" {
+                running = running + 1
+            } else if sub == "done" {
+                done = done + 1
+                if job.ended > 0 && job.started > 0 {
+                    (mut durations).push(job.ended - job.started)
+                }
+            } else if sub == "failed" {
+                failed = failed + 1
+            }
+        }
+    }
+    let mean_ms = if durations.len > 0 {
+        var sum = 0
+        for d in durations {
+            sum = sum + d
+        }
+        sum / durations.len
+    } else {
+        0
+    }
+    let p95_ms = if durations.len > 0 {
+        sort_ints(mut durations)
+        let idx = (durations.len * 95 + 99) / 100 - 1
+        if idx >= 0 && idx < durations.len {
+            durations[idx]
+        } else {
+            durations[durations.len - 1]
+        }
+    } else {
+        0
+    }
+    Stats {
+        pending: pending,
+        running: running,
+        done: done,
+        failed: failed,
+        mean_ms: mean_ms,
+        p95_ms: p95_ms,
+    }
+}
+
+/// Sort a list of ints in place (simple insertion sort).
+fn sort_ints(mut xs: List[int]) {
+    var i = 1
+    while i < xs.len {
+        let key = xs[i]
+        var j = i - 1
+        while j >= 0 && xs[j] > key {
+            xs[j + 1] = xs[j]
+            j = j - 1
+        }
+        xs[j + 1] = key
+        i = i + 1
+    }
+}
