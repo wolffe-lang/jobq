@@ -201,9 +201,28 @@ else
 fi
 rm -rf "$DIR"
 
-# R4: Lease expiry and reclaim — a job longer than the lease is reclaimed
-echo "=== R4: Lease expiry and reclaim ==="
-DIR="/tmp/jobq-test-r4"
+# R4: a job longer than the lease runs ONCE while its runner is alive (lease renewal)
+echo "=== R4: Renewal under a live runner ==="
+DIR="/tmp/jobq-test-r4"; OUT="/tmp/jobq-test-r4.out"; rm -rf "$DIR" "$OUT"
+"$JOBQ" init "$DIR"
+"$JOBQ" add --dir "$DIR" -- sh -c "printf x >> $OUT; sleep 6" > /dev/null
+"$JOBQ" run --dir "$DIR" -j 1 --lease 2 > /dev/null 2>&1 &
+RUNNER_A=$!
+sleep 3
+"$JOBQ" run --dir "$DIR" -j 1 --lease 2 > /dev/null 2>&1 || true
+wait $RUNNER_A || true
+BYTES=$(wc -c < "$OUT" | tr -d ' ')
+DONE=$("$JOBQ" ls --dir "$DIR" --state done | grep -c '^[0-9]')
+if [ "$BYTES" = "1" ] && [ "$DONE" = "1" ] && grep -q "tries=0" "$DIR"/done/*; then
+    pass "R4"
+else
+    fail "R4: bytes=$BYTES done=$DONE"
+fi
+rm -rf "$DIR" "$OUT"
+
+# R5: kill and reclaim — a runner killed mid-job, lease expires, second runner reclaims
+echo "=== R5: Kill and reclaim ==="
+DIR="/tmp/jobq-test-r5"
 "$JOBQ" init "$DIR"
 "$JOBQ" add --dir "$DIR" -- sh -c "sleep 6; echo done" > /dev/null
 # Start runner A with a 2-second lease
@@ -220,9 +239,9 @@ sleep 3
 # Check: the job is done exactly once
 DONE=$("$JOBQ" ls --dir "$DIR" --state done | wc -l)
 if [ "$DONE" -eq 1 ]; then
-    pass "R4"
+    pass "R5"
 else
-    fail "R4: done=$DONE"
+    fail "R5: done=$DONE"
 fi
 rm -rf "$DIR"
 
