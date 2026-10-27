@@ -5,9 +5,8 @@
 //! File layout:
 //!   main.lu      — CLI dispatch, argument parsing, main()
 //!   store.lu     — queue layout, job file read/write, claim/release/finish
-//!   runner.lu    — worker loop: claim, spawn, capture, lease renewal
-//!   cli.lu       — subcommand implementations (init, add, run, ls, show, retry, stats)
 //!   main_test.lu — black-box tests (CLI surface, quoting, claim semantics)
+//!   test.sh      — acceptance tests (R1–R5, A1–A2, F1, S1, M1, P1, T1, FR-12)
 //!
 //! FR-10 (TERM handling): wolf's signal model is event-based (std.signal.listen
 //! + wait). A TERM'd runner's child processes continue; the lease is the safety
