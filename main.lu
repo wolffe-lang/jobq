@@ -360,6 +360,7 @@ fn finish_one_job(dir: str, name: str, exit: int) -> bool {
 }
 
 /// Run jobs with N workers, with lease renewal via poll loop.
+/// Lists queue/ once per sweep, claims from the list.
 fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: bool) -> !int {
     if !queue_check(dir) {
         print("jobq: " + dir + ": not a queue")
@@ -374,15 +375,28 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
         lease_renewal_interval = 500
     }
     var last_renewal = time.unix_ms()
+    var read_dir_calls = 0
+    var pending_names = List[str]()
 
     while true {
         // Reclaim expired leases before claiming
         let _ = reclaim_expired(dir, max_tries) else 0
 
+        // Refill the pending list if empty
+        if pending_names.len == 0 {
+            pending_names = fs.read_dir(dir + "/queue") else List[str]()
+            read_dir_calls = read_dir_calls + 1
+        }
+
         // Claim more jobs if we have capacity
-        while running.len < jobs {
-            let name = claim_job(dir) else |e| match e {
-                parse => { continue },
+        while running.len < jobs && pending_names.len > 0 {
+            let name = claim_job_from(pending_names, dir) else |e| match e {
+                parse => {
+                    // Remove from pending list
+                    pending_names[0] = pending_names[pending_names.len - 1]
+                    (mut pending_names).pop() else |_| { "" }
+                    continue
+                },
                 not_found => { break },
                 denied => {
                     print("jobq: cannot claim job")
@@ -391,8 +405,14 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
                 io => { break },
             }
             if name.len == 0 {
-                break
+                // Remove from pending list
+                pending_names[0] = pending_names[pending_names.len - 1]
+                (mut pending_names).pop() else |_| { "" }
+                continue
             }
+            // Remove claimed name from pending list
+            pending_names[0] = pending_names[pending_names.len - 1]
+            (mut pending_names).pop() else |_| { "" }
             // Start the job
             if !start_one_job(dir, name, lease, worker_id, mut running) {
                 count = count + 1
@@ -403,7 +423,7 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
         }
 
         // If nothing is running and nothing to claim, we're done
-        if running.len == 0 {
+        if running.len == 0 && pending_names.len == 0 {
             break
         }
 
@@ -465,6 +485,7 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
         return 0
     }
     print("jobq: ran {count} jobs")
+    print("read_dir calls: {read_dir_calls}")
     if any_failed {
         return 1
     }

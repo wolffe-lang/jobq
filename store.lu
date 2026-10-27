@@ -462,6 +462,27 @@ pub fn claim_job(dir: str) -> str ! {not_found, denied, io, parse} {
     ""
 }
 
+/// Claim a job from a pre-listed set of names.
+/// Returns the filename if successful, empty string if no job was claimed.
+pub fn claim_job_from(names: List[str], dir: str) -> str ! {not_found, denied, io, parse} {
+    for name in names {
+        let path = dir + "/queue/" + name
+        // Parse BEFORE the rename — malformed files stay where they are
+        read_job(path) else |e| match e {
+            parse => { continue },
+            not_found => { continue },
+            denied => { return denied },
+            utf8 => { continue },
+            io => { continue },
+        }
+        let from = dir + "/queue/" + name
+        let to = dir + "/running/" + name
+        fs.move_file(from, to) else |_| { continue }
+        return name
+    }
+    ""
+}
+
 /// Reclaim expired leases from running/. Moves expired jobs back to queue/
 /// with tries incremented. If tries >= max_tries, moves to failed/ with
 /// status=lease-expired. Returns the number of jobs reclaimed.

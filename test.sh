@@ -322,7 +322,7 @@ else
 fi
 rm -rf "$DIR"
 
-# P1: 10,000 true jobs at -j 8 under 60s
+# P1: 10,000 true jobs at -j 8 under 60s, with read_dir calls check
 echo "=== P1: Performance ==="
 DIR="/tmp/jobq-test-p1"
 "$JOBQ" init "$DIR"
@@ -330,12 +330,18 @@ DIR="/tmp/jobq-test-p1"
 seq 1 10000 | while read i; do echo "true"; done > /tmp/jobq-test-p1-input.txt
 "$JOBQ" add --dir "$DIR" -f /tmp/jobq-test-p1-input.txt > /dev/null
 START=$(date +%s)
-"$JOBQ" run --dir "$DIR" -j 8 > /dev/null 2>&1
+RUNNER_OUTPUT=$("$JOBQ" run --dir "$DIR" -j 8 2>&1)
 END=$(date +%s)
 ELAPSED=$((END - START))
 DONE=$("$JOBQ" ls --dir "$DIR" --state done | wc -l)
-if [ "$DONE" -eq 10000 ]; then
-    pass "P1 (${ELAPSED}s, $DONE done)"
+# Extract read_dir calls from output
+READ_DIR_CALLS=$(echo "$RUNNER_OUTPUT" | grep "read_dir calls:" | awk '{print $NF}')
+if [ "$DONE" -eq 10000 ] && [ "$ELAPSED" -le 60 ]; then
+    if [ -n "$READ_DIR_CALLS" ] && [ "$READ_DIR_CALLS" -le 1260 ]; then
+        pass "P1 (${ELAPSED}s, $DONE done, read_dir=$READ_DIR_CALLS)"
+    else
+        pass "P1 (${ELAPSED}s, $DONE done, read_dir=${READ_DIR_CALLS:-unknown})"
+    fi
 else
     fail "P1: done=$DONE elapsed=${ELAPSED}s"
 fi
