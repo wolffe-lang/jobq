@@ -114,7 +114,35 @@ pub fn create_job(dir: str, cmd: List[str]) -> str ! fs_err {
     return "{id}"
 }
 
-/// Build the text content of a job file.
+/// Render a Job struct to its file text.
+fn render_job(job: Job) -> str {
+    var b = strbuf.new()
+    strbuf.push_str(mut b, "id=" + job.id + "\n")
+    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
+    strbuf.push_str(mut b, "added={job.added}\n")
+    strbuf.push_str(mut b, "tries={job.tries}\n")
+    if job.runner.len > 0 {
+        strbuf.push_str(mut b, "runner=" + job.runner + "\n")
+    }
+    if job.lease > 0 {
+        strbuf.push_str(mut b, "lease={job.lease}\n")
+    }
+    if job.started > 0 {
+        strbuf.push_str(mut b, "started={job.started}\n")
+    }
+    if job.status.len > 0 {
+        strbuf.push_str(mut b, "status=" + job.status + "\n")
+    }
+    if job.ended > 0 {
+        strbuf.push_str(mut b, "ended={job.ended}\n")
+    }
+    if job.exit > 0 || job.status.len > 0 {
+        strbuf.push_str(mut b, "exit={job.exit}\n")
+    }
+    strbuf.to_str(b)
+}
+
+/// Build the text content of a new job file.
 fn build_job_text(id: str, cmd: List[str]) -> str {
     var b = strbuf.new()
     strbuf.push_str(mut b, "id=" + id + "\n")
@@ -496,35 +524,26 @@ pub fn reclaim_expired(dir: str, max_tries: int) -> int ! fs_err {
     let now = time.unix_ms()
     for name in names {
         let path = dir + "/running/" + name
-        let job = read_job(path) else |_| { continue }
+        var job = read_job(path) else |_| { continue }
         if job.lease > 0 && now > job.lease {
             // Lease expired
             let new_tries = job.tries + 1
             if new_tries >= max_tries {
                 // Move to failed/ with lease-expired status
-                var b = strbuf.new()
-                strbuf.push_str(mut b, "id=" + job.id + "\n")
-                strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
-                strbuf.push_str(mut b, "added={job.added}\n")
-                strbuf.push_str(mut b, "tries={new_tries}\n")
-                strbuf.push_str(mut b, "runner=" + job.runner + "\n")
-                strbuf.push_str(mut b, "lease={job.lease}\n")
-                strbuf.push_str(mut b, "started={job.started}\n")
-                strbuf.push_str(mut b, "status=lease-expired\n")
-                strbuf.push_str(mut b, "ended={now}\n")
-                strbuf.push_str(mut b, "exit=0\n")
+                job.tries = new_tries
+                job.status = "lease-expired"
+                job.ended = now
                 let to = dir + "/failed/" + name
-                fs.write_text(to, strbuf.to_str(b))?
+                fs.write_text(to, render_job(job))?
                 fs.remove(path)?
             } else {
                 // Move back to queue/ with incremented tries
-                var b = strbuf.new()
-                strbuf.push_str(mut b, "id=" + job.id + "\n")
-                strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
-                strbuf.push_str(mut b, "added={job.added}\n")
-                strbuf.push_str(mut b, "tries={new_tries}\n")
+                job.tries = new_tries
+                job.runner = ""
+                job.lease = 0
+                job.started = 0
                 let to = dir + "/queue/" + name
-                fs.write_text(to, strbuf.to_str(b))?
+                fs.write_text(to, render_job(job))?
                 fs.remove(path)?
             }
             count = count + 1
@@ -536,34 +555,21 @@ pub fn reclaim_expired(dir: str, max_tries: int) -> int ! fs_err {
 /// Rewrite a job file in running/ with updated fields.
 pub fn update_job(dir: str, name: str, runner: str, lease: int, started: int) -> () ! fs_err {
     let path = dir + "/running/" + name
-    let job = read_job(path) else |_| { return }
-    var b = strbuf.new()
-    strbuf.push_str(mut b, "id=" + job.id + "\n")
-    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
-    strbuf.push_str(mut b, "added={job.added}\n")
-    strbuf.push_str(mut b, "tries={job.tries}\n")
-    strbuf.push_str(mut b, "runner=" + runner + "\n")
-    strbuf.push_str(mut b, "lease={lease}\n")
-    strbuf.push_str(mut b, "started={started}\n")
-    fs.write_text(path, strbuf.to_str(b))?
+    var job = read_job(path) else |_| { return }
+    job.runner = runner
+    job.lease = lease
+    job.started = started
+    fs.write_text(path, render_job(job))?
 }
 
 /// Finish a job: write final fields and move to done/ or failed/.
 pub fn finish_job(dir: str, name: str, status: str, exit: int, ended: int) -> () ! fs_err {
     let path = dir + "/running/" + name
-    let job = read_job(path) else |_| { return }
-    var b = strbuf.new()
-    strbuf.push_str(mut b, "id=" + job.id + "\n")
-    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
-    strbuf.push_str(mut b, "added={job.added}\n")
-    strbuf.push_str(mut b, "tries={job.tries}\n")
-    strbuf.push_str(mut b, "runner=" + job.runner + "\n")
-    strbuf.push_str(mut b, "lease={job.lease}\n")
-    strbuf.push_str(mut b, "started={job.started}\n")
-    strbuf.push_str(mut b, "status=" + status + "\n")
-    strbuf.push_str(mut b, "ended={ended}\n")
-    strbuf.push_str(mut b, "exit={exit}\n")
-    fs.write_text(path, strbuf.to_str(b))?
+    var job = read_job(path) else |_| { return }
+    job.status = status
+    job.exit = exit
+    job.ended = ended
+    fs.write_text(path, render_job(job))?
     let dest = if status == "ok" { "done" } else { "failed" }
     let to = dir + "/" + dest + "/" + name
     fs.move_file(path, to)?
@@ -584,16 +590,9 @@ pub fn append_log(dir: str, id: str, text: str) -> () ! fs_err {
 /// Renew a job's lease by rewriting the file with a new expiry.
 pub fn renew_lease(dir: str, name: str, new_lease: int) -> () ! fs_err {
     let path = dir + "/running/" + name
-    let job = read_job(path) else |_| { return }
-    var b = strbuf.new()
-    strbuf.push_str(mut b, "id=" + job.id + "\n")
-    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
-    strbuf.push_str(mut b, "added={job.added}\n")
-    strbuf.push_str(mut b, "tries={job.tries}\n")
-    strbuf.push_str(mut b, "runner=" + job.runner + "\n")
-    strbuf.push_str(mut b, "lease={new_lease}\n")
-    strbuf.push_str(mut b, "started={job.started}\n")
-    fs.write_text(path, strbuf.to_str(b))?
+    var job = read_job(path) else |_| { return }
+    job.lease = new_lease
+    fs.write_text(path, render_job(job))?
 }
 
 /// Move a failed job back to the queue with tries reset.
@@ -601,13 +600,15 @@ pub fn retry_job(dir: str, name: str) -> () ! fs_err {
     let from = dir + "/failed/" + name
     let to = dir + "/queue/" + name
     // Read the job to reset tries
-    let job = read_job(from) else |_| { return }
-    var b = strbuf.new()
-    strbuf.push_str(mut b, "id=" + job.id + "\n")
-    strbuf.push_str(mut b, "cmd=" + json_encode(job.cmd) + "\n")
-    strbuf.push_str(mut b, "added={job.added}\n")
-    strbuf.push_str(mut b, "tries=0\n")
-    fs.write_text(to, strbuf.to_str(b))?
+    var job = read_job(from) else |_| { return }
+    job.tries = 0
+    job.runner = ""
+    job.lease = 0
+    job.started = 0
+    job.status = ""
+    job.ended = 0
+    job.exit = 0
+    fs.write_text(to, render_job(job))?
     fs.remove(from)?
 }
 

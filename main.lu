@@ -281,6 +281,13 @@ struct RunningChild {
     log_path: str,
 }
 
+/// Finish a failed job: close log, write final fields, move to failed/.
+fn fail_job(dir: str, name: str, take log_f: fs.File, code: int) -> () {
+    fs.close(take log_f) else |_| {}
+    let ended = time.unix_ms()
+    finish_job(dir, name, "failed", code, ended) else |_| {}
+}
+
 /// Start one job: the job is already claimed (name is in running/).
 /// Spawn with start(), append the RunningChild to the list.
 /// Returns true on success, false on failure (job is finished with an error).
@@ -313,36 +320,11 @@ fn start_one_job(
     process.set_stderr(mut cmd, log_f)
     // Start the command (non-blocking)
     var child = process.start(cmd) else |e| match e {
-        not_found => {
-            fs.close(take log_f) else |_| {}
-            let ended = time.unix_ms()
-            finish_job(dir, name, "failed", 127, ended) else |_| {}
-            return false
-        },
-        denied => {
-            fs.close(take log_f) else |_| {}
-            let ended = time.unix_ms()
-            finish_job(dir, name, "failed", 126, ended) else |_| {}
-            return false
-        },
-        io => {
-            fs.close(take log_f) else |_| {}
-            let ended = time.unix_ms()
-            finish_job(dir, name, "failed", 1, ended) else |_| {}
-            return false
-        },
-        invalid => {
-            fs.close(take log_f) else |_| {}
-            let ended = time.unix_ms()
-            finish_job(dir, name, "failed", 1, ended) else |_| {}
-            return false
-        },
-        unsupported => {
-            fs.close(take log_f) else |_| {}
-            let ended = time.unix_ms()
-            finish_job(dir, name, "failed", 1, ended) else |_| {}
-            return false
-        },
+        not_found => { fail_job(dir, name, take log_f, 127); return false },
+        denied => { fail_job(dir, name, take log_f, 126); return false },
+        io => { fail_job(dir, name, take log_f, 1); return false },
+        invalid => { fail_job(dir, name, take log_f, 1); return false },
+        unsupported => { fail_job(dir, name, take log_f, 1); return false },
     }
     // Close the log file - the child has its own reference
     fs.close(take log_f) else |_| {}
