@@ -40,6 +40,7 @@ fn usage() -> !int {
     print("  --max-tries N  Max retries before permanent failure (default: 3)")
     print("  --state S      Filter by state: pending, running, done, failed, all")
     print("  --help         Show this help")
+    print("  --version      Show version")
     0
 }
 
@@ -573,6 +574,10 @@ fn main() -> !int {
     if args.len == 0 {
         usage()
         return 2
+    }
+    if args[0] == "--version" {
+        print("jobq 0.1.0 (built with wolf 0.2.34)")
+        return 0
     }
     if args[0] == "--help" {
         return usage()

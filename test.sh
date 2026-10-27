@@ -28,6 +28,16 @@ cleanup() {
 
 cleanup
 
+# V1: --version prints the version line and exits 0
+echo "=== V1: --version ==="
+VERSION_OUTPUT=$("$JOBQ" --version 2>&1)
+VERSION_EXIT=$?
+if [ "$VERSION_EXIT" -eq 0 ] && echo "$VERSION_OUTPUT" | grep -q "jobq 0.1.0"; then
+    pass "V1"
+else
+    fail "V1: exit=$VERSION_EXIT output=$VERSION_OUTPUT"
+fi
+
 # A1: --help exits 0
 echo "=== A1: --help ==="
 "$JOBQ" --help > /dev/null 2>&1
