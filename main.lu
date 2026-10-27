@@ -10,10 +10,10 @@
 //!   main_test.lu — black-box tests (CLI surface, quoting, claim semantics)
 //!
 //! FR-10 (TERM handling): wolf's signal model is event-based (std.signal.listen
-//! + wait), but process.run() blocks without being interrupted by signals.
-//! A TERM'd runner is killed by the host; its in-flight job's lease expires
-//! and another runner reclaims it. This is the documented posture — the lease
-//! is the safety net, and it works (R2, R3).
+//! + wait). A TERM'd runner's child processes continue; the lease is the safety
+//! net — an expired lease is reclaimed by another runner (R2, R3, R4, T1).
+//! The runner uses process.start() + process.poll() with lease renewal every
+//! lease/3 seconds to keep long-running jobs alive.
 
 use std.env
 use std.fs
@@ -275,9 +275,23 @@ fn cmd_add_file(dir: str, file: str) -> !int {
     0
 }
 
-/// Run one job with lease renewal: the job is already claimed (name is in running/).
-/// Returns true if the job failed.
-fn run_one_job(dir: str, name: str, lease: int, worker_id: int) -> bool {
+/// A running child tracked by cmd_run.
+struct RunningChild {
+    slot: int,
+    name: str,
+    log_path: str,
+}
+
+/// Start one job: the job is already claimed (name is in running/).
+/// Spawn with start(), append the RunningChild to the list.
+/// Returns true on success, false on failure (job is finished with an error).
+fn start_one_job(
+    dir: str,
+    name: str,
+    lease: int,
+    worker_id: int,
+    mut out: List[RunningChild],
+) -> bool {
     // Read the job
     let job_path = dir + "/running/" + name
     let job = read_job(job_path) else |_| { return false }
@@ -298,55 +312,54 @@ fn run_one_job(dir: str, name: str, lease: int, worker_id: int) -> bool {
     // Set stdout and stderr to the log file
     process.set_stdout(mut cmd, log_f)
     process.set_stderr(mut cmd, log_f)
-    // Run the command (blocks until the child ends)
-    let exit = process.run(cmd) else |e| match e {
+    // Start the command (non-blocking)
+    var child = process.start(cmd) else |e| match e {
         not_found => {
             fs.close(take log_f) else |_| {}
             let ended = time.unix_ms()
             finish_job(dir, name, "failed", 127, ended) else |_| {}
-            return true
+            return false
         },
         denied => {
             fs.close(take log_f) else |_| {}
             let ended = time.unix_ms()
             finish_job(dir, name, "failed", 126, ended) else |_| {}
-            return true
-        },
-        signal => {
-            fs.close(take log_f) else |_| {}
-            let ended = time.unix_ms()
-            finish_job(dir, name, "killed", 130, ended) else |_| {}
-            return true
+            return false
         },
         io => {
             fs.close(take log_f) else |_| {}
             let ended = time.unix_ms()
             finish_job(dir, name, "failed", 1, ended) else |_| {}
-            return true
+            return false
         },
         invalid => {
             fs.close(take log_f) else |_| {}
             let ended = time.unix_ms()
             finish_job(dir, name, "failed", 1, ended) else |_| {}
-            return true
+            return false
         },
         unsupported => {
             fs.close(take log_f) else |_| {}
             let ended = time.unix_ms()
             finish_job(dir, name, "failed", 1, ended) else |_| {}
-            return true
+            return false
         },
     }
-    // Close the log file
+    // Close the log file - the child has its own reference
     fs.close(take log_f) else |_| {}
-    // Finish the job
+    (mut out).push(RunningChild { slot: child.slot, name: name, log_path: log_path })
+    true
+}
+
+/// Finish one job: write final fields, move to done/ or failed/.
+fn finish_one_job(dir: str, name: str, exit: int) -> bool {
     let ended_ms = time.unix_ms()
     let status = if exit == 0 { "ok" } else { "failed" }
     finish_job(dir, name, status, exit, ended_ms) else |_| { return false }
     exit != 0
 }
 
-/// Run jobs with N workers.
+/// Run jobs with N workers, with lease renewal via poll loop.
 fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: bool) -> !int {
     if !queue_check(dir) {
         print("jobq: " + dir + ": not a queue")
@@ -355,29 +368,98 @@ fn cmd_run(dir: str, jobs: int, lease: int, max_tries: int, follow: bool, once: 
     var any_failed = false
     var count = 0
     var worker_id = 0
+    var running = List[RunningChild]()
+    var lease_renewal_interval = lease * 1000 / 3
+    if lease_renewal_interval < 500 {
+        lease_renewal_interval = 500
+    }
+    var last_renewal = time.unix_ms()
+
     while true {
         // Reclaim expired leases before claiming
         let _ = reclaim_expired(dir, max_tries) else 0
-        let name = claim_job(dir) else |e| match e {
-            parse => { continue },
-            not_found => { continue },
-            denied => {
-                print("jobq: cannot claim job")
-                return 2
-            },
-            io => { continue },
+
+        // Claim more jobs if we have capacity
+        while running.len < jobs {
+            let name = claim_job(dir) else |e| match e {
+                parse => { continue },
+                not_found => { break },
+                denied => {
+                    print("jobq: cannot claim job")
+                    return 2
+                },
+                io => { break },
+            }
+            if name.len == 0 {
+                break
+            }
+            // Start the job
+            if !start_one_job(dir, name, lease, worker_id, mut running) {
+                count = count + 1
+                worker_id = worker_id + 1
+                continue
+            }
+            worker_id = worker_id + 1
         }
-        if name.len == 0 {
+
+        // If nothing is running and nothing to claim, we're done
+        if running.len == 0 {
             break
         }
-        // Run the job with lease renewal
-        let failed = run_one_job(dir, name, lease, worker_id)
-        if failed {
-            any_failed = true
+
+        // Renew leases if needed
+        let now = time.unix_ms()
+        if now - last_renewal >= lease_renewal_interval {
+            var i = 0
+            while i < running.len {
+                let new_lease = now + lease * 1000
+                renew_lease(dir, running[i].name, new_lease) else |_| {}
+                i = i + 1
+            }
+            last_renewal = now
         }
-        count = count + 1
-        worker_id = worker_id + 1
+
+        // Poll for ended children
+        var change = process.poll() else |_| { break }
+        if change.changed {
+            // Find the matching child in our list by slot
+            var found = -1
+            var i = 0
+            while i < running.len {
+                if running[i].slot == change.child.slot {
+                    found = i
+                    break
+                }
+                i = i + 1
+            }
+            if found >= 0 {
+                // Get exit code
+                let status = change.status.value
+                var exit = 0
+                if status >= 0 && status <= 255 {
+                    exit = status
+                } else if status < 0 {
+                    exit = 130
+                }
+                // Extract the name before the swap
+                let rc_name = running[found].name
+                // Swap with last to remove
+                running[found] = running[running.len - 1]
+                // Pop the last element
+                (mut running).pop() else |_| { RunningChild { slot: -1, name: "", log_path: "" } }
+                // Finish the job
+                let failed = finish_one_job(dir, rc_name, exit)
+                if failed {
+                    any_failed = true
+                }
+                count = count + 1
+            }
+        } else {
+            // No child changed; sleep briefly before polling again
+            time.sleep(time.millis(2))
+        }
     }
+
     if count == 0 {
         print("jobq: no jobs to run")
         return 0
