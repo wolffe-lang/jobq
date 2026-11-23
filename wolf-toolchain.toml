@@ -4,6 +4,8 @@ repo = "wolffe-lang/wolf-lang"
 rev = "b333b9da8560e4e1dfd6e30099d14d98e752f9e1"
 version_line = "wolf 0.2.40 (wolfgang, pin b333b9d)"
 aarch64-apple-darwin = "3f18a56562fb089da05a50a612e031cd297f20a617b9e6e7ada768fbeb69e72b"
+x86_64-unknown-linux-gnu = "bc2020e0b7400c18162a6072c299c65c0582ea74a0eba22aaa57ca04ae13e7e1"
+aarch64-unknown-linux-gnu = "cea26eea215e7cdba60db2870c0eb4d2c5738065046ec5fe6e0eec7da55e48cd"
 
 [lupin]
 version = "0.1.62"
@@ -11,6 +13,8 @@ repo = "wolffe-lang/wolf-interp"
 rev = "72eff3c99b3a9e434b059f5dd3e4b1d29c862ddc"
 version_line = "lupin 0.1.62 (wolf-interp, reference interpreter at pin 5f1f1c9)"
 aarch64-apple-darwin = "228790ef3aef7605a2f9524abdcb6de5c8a5fa179437d82f3d3af262495a4e7f"
+x86_64-unknown-linux-gnu = "3b3bf9c23a9e545a4a99e65a5183d0c5e71e91d6bfb8a189147e2701c03e177f"
+aarch64-unknown-linux-gnu = "f5391308ad9cd8ae1e31a42e7a17c1453679e2a0ac03f83783c4ac52e650ef2e"
 
 [std]
 repo = "wolffe-lang/wolf-std"
