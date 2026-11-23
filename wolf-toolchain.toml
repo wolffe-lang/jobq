@@ -1,0 +1,17 @@
+[wolf]
+version = "0.2.40"
+repo = "wolffe-lang/wolf-lang"
+rev = "b333b9da8560e4e1dfd6e30099d14d98e752f9e1"
+version_line = "wolf 0.2.40 (wolfgang, pin b333b9d)"
+aarch64-apple-darwin = "3f18a56562fb089da05a50a612e031cd297f20a617b9e6e7ada768fbeb69e72b"
+
+[lupin]
+version = "0.1.62"
+repo = "wolffe-lang/wolf-interp"
+rev = "72eff3c99b3a9e434b059f5dd3e4b1d29c862ddc"
+version_line = "lupin 0.1.62 (wolf-interp, reference interpreter at pin 5f1f1c9)"
+aarch64-apple-darwin = "228790ef3aef7605a2f9524abdcb6de5c8a5fa179437d82f3d3af262495a4e7f"
+
+[std]
+repo = "wolffe-lang/wolf-std"
+rev = "be1d10fa2798cc6bc2a1fd0b2e559e283469c9bf"
