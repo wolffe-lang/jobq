@@ -34,6 +34,9 @@ error read_err = {not_found, denied, utf8, io}
 /// Job read error row.
 error job_err = {not_found, denied, utf8, io, parse}
 
+/// Claim error row.
+error claim_err = {not_found, denied, io, parse}
+
 /// A parsed job record.
 pub struct Job {
     id: str,
@@ -470,7 +473,7 @@ fn split_quoted(line: str) -> List[str] {
 /// Parses the file BEFORE the rename; if parse fails, the file stays in queue/
 /// and the error is returned. Returns the filename if successful, empty string
 /// if no job was claimed.
-pub fn claim_job(dir: str) -> str ! {not_found, denied, io, parse} {
+pub fn claim_job(dir: str) -> str ! claim_err {
     let names = fs.read_dir(dir + "/queue") else List[str]()
     for name in names {
         let path = dir + "/queue/" + name
@@ -493,7 +496,7 @@ pub fn claim_job(dir: str) -> str ! {not_found, denied, io, parse} {
 /// Claim a job from a pre-listed set of names.
 /// Returns the filename if successful, empty string if no job was claimed.
 /// Prints malformed file names to stderr.
-pub fn claim_job_from(names: List[str], dir: str) -> str ! {not_found, denied, io, parse} {
+pub fn claim_job_from(names: List[str], dir: str) -> str ! claim_err {
     for name in names {
         let path = dir + "/queue/" + name
         // Parse BEFORE the rename — malformed files stay where they are
